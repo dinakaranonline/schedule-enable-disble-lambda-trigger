@@ -1,0 +1,149 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+
+# This section creates a dummy Lambda function, an SQS queue, and
+# an Event Source Mapping that connects the two.
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - 'sqs:ReceiveMessage'
+                  - 'sqs:DeleteMessage'
+                  - 'sqs:GetQueueAttributes'
+                Resource: !GetAtt Queue.Arn
+
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          omitted
+      FunctionName: night-lambda-function-2
+      Handler: example.only
+      Role: !GetAtt FunctionRole.Arn
+      Runtime: nodejs12.x
+
+  Queue:
+    Type: AWS::SQS::Queue
+
+  EventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt Queue.Arn
+      FunctionName: !GetAtt Function.Arn
+
+# This section creates a Lambda function that contains code to
+# call Lambda's UpdateEventSourceMapping API action. It also
+# gives EventBridge permission to invoke the function.
+
+  ToggleFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'lambda:UpdateEventSourceMapping'
+                Resource: !Sub
+                  - 'arn:aws:lambda:${Region}:${AccountId}:event-source-mapping:${UUID}'
+                  - Region: !Ref AWS::Region
+                    AccountId: !Ref AWS::AccountId
+                    UUID: !Ref EventSourceMapping
+
+  EventBridgeEnablePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ToggleFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EnableRule.Arn
+
+  EventBridgeDisablePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ToggleFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DisableRule.Arn
+
+  ToggleFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk')
+          const lambda = new AWS.Lambda();
+
+          exports.handler = async (event) => {
+              const params = {
+                  UUID: event.uuid,
+                  Enabled: event.enabled
+              };
+              
+              return await lambda.updateEventSourceMapping(params).promise();
+          };
+      FunctionName: night-lambda-toggle-function
+      Handler: index.handler
+      Role: !GetAtt ToggleFunctionRole.Arn
+      Runtime: nodejs12.x
+
+
+# This section creates two self-triggering EventBridge rules, each with
+# Lambda target. These two rules Invoke the above Lambda to enable and
+# disable the above Event Source Mapping on a schedule.
+
+  EnableRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: enable-night-lambda-2
+      ScheduleExpression: 'cron(0 1 * * ? *)'
+      Targets:
+        - Id: LambdaTarget
+          Arn: !GetAtt ToggleFunction.Arn
+          Input: !Sub
+            - '{ "enabled": true, "uuid": "${UUID}" }'
+            - UUID: !Ref EventSourceMapping
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 3600
+
+  DisableRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: disable-night-lambda-2
+      ScheduleExpression: 'cron(0 6 * * ? *)'
+      Targets:
+        - Id: LambdaTarget
+          Arn: !GetAtt ToggleFunction.Arn
+          Input: !Sub
+            - '{ "enabled": false, "uuid": "${UUID}" }'
+            - UUID: !Ref EventSourceMapping
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 3600

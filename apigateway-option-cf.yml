@@ -1,0 +1,194 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Resources:
+
+# This section creates a dummy Lambda function, an SQS queue, and
+# an Event Source Mapping that connects the two.
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - 'sqs:ReceiveMessage'
+                  - 'sqs:DeleteMessage'
+                  - 'sqs:GetQueueAttributes'
+                Resource: !GetAtt Queue.Arn
+
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          omitted
+      FunctionName: night-lambda-function-1
+      Handler: example.only
+      Role: !GetAtt FunctionRole.Arn
+      Runtime: nodejs12.x
+
+  Queue:
+    Type: AWS::SQS::Queue
+
+  EventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt Queue.Arn
+      FunctionName: !GetAtt Function.Arn
+
+# This section creates an API Gateway REST API configured with a service
+# integration that calls Lambda's UpdateEventSourceMapping API action.
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: night-lambda-api
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiIntegrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'lambda:UpdateEventSourceMapping'
+                Resource: !Sub
+                  - 'arn:aws:lambda:${Region}:${AccountId}:event-source-mapping:${UUID}'
+                  - Region: !Ref AWS::Region
+                    AccountId: !Ref AWS::AccountId
+                    UUID: !Ref EventSourceMapping
+
+  ApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: PUT
+      ResourceId: !GetAtt RestApi.RootResourceId
+      RestApiId: !Ref RestApi
+      AuthorizationType: AWS_IAM
+      RequestParameters:
+        'method.request.header.Content-Type': true
+      MethodResponses:
+        - StatusCode: 202
+      Integration:
+        IntegrationHttpMethod: PUT
+        Type: AWS
+        Credentials: !GetAtt ApiIntegrationRole.Arn
+        Uri: !Sub
+          - 'arn:aws:apigateway:${Region}:lambda:path/2015-03-31/event-source-mappings/${UUID}'
+          - Region: !Ref AWS::Region
+            UUID: !Ref EventSourceMapping
+        IntegrationResponses:
+          - StatusCode: 202
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref RestApi
+    DependsOn:
+      - ApiMethod
+
+# This section creates two self-triggering EventBridge rules, each with an
+# API Gateway target. These two rules call the above API to enable and
+# disable the above Event Source Mapping on a schedule.
+
+  EventsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'execute-api:Invoke'
+                Resource: !Sub
+                  - 'arn:aws:execute-api:${Region}:${AccountId}:${RestApi}/${ApiStage}/PUT/'
+                  - Region: !Ref AWS::Region
+                    AccountId: !Ref AWS::AccountId
+                    RestApi: !Ref RestApi
+                    ApiStage: !Ref ApiStage
+
+  EnableRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: enable-night-lambda-1
+      ScheduleExpression: 'cron(0 1 * * ? *)'
+      Targets:
+        - Id: ApiTarget
+          Arn: !Sub
+            - 'arn:aws:execute-api:${Region}:${AccountId}:${RestApi}/${ApiStage}/PUT/'
+            - Region: !Ref AWS::Region
+              AccountId: !Ref AWS::AccountId
+              RestApi: !Ref RestApi
+              ApiStage: !Ref ApiStage
+          HttpParameters:
+            HeaderParameters:
+              'Content-Type': 'application/json'
+          Input: '{ "Enabled": true }'
+          RoleArn: !GetAtt EventsRole.Arn
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 3600
+
+  DisableRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: disable-night-lambda-1
+      ScheduleExpression: 'cron(0 6 * * ? *)'
+      Targets:
+        - Id: ApiTarget
+          Arn: !Sub 
+            - 'arn:aws:execute-api:${Region}:${AccountId}:${RestApi}/${ApiStage}/PUT/'
+            - Region: !Ref AWS::Region
+              AccountId: !Ref AWS::AccountId
+              RestApi: !Ref RestApi
+              ApiStage: !Ref ApiStage
+          HttpParameters:
+            HeaderParameters:
+              'Content-Type': 'application/json'
+          Input: '{ "Enabled": false }'
+          RoleArn: !GetAtt EventsRole.Arn
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 3600
